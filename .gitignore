@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# macOS
+.DS_Store
+
+# Build artifacts
+libs/*.dylib
+
+# External repositories (clone separately)
+KPQClean/
+
+# Experiment results & logs
+results/
+logs/
+
+# Claude project files
+.claude/
+
+# Signature pool (large binary files)
+data/sig_pool/
+
+# SQLite database files
+*.db
