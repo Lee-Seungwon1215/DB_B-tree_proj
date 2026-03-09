@@ -12,7 +12,7 @@
 
 import time
 from config import RANGE_SCAN_COUNT
-from data.generator_phase1 import get_time_range
+from data.generator import get_time_range
 
 
 def run(conn, strategy_module, algorithm_name: str, n: int) -> dict:

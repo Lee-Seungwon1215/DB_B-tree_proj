@@ -107,10 +107,3 @@ RANGE_RATIO       = 0.1    # 전체의 10% 범위 조회
 SIG_POOL_SIZE     = 10_000  # 사전 생성 서명 수 (DB 삽입 시 순환 사용)
 SIG_POOL_DIR      = "data/sig_pool"
 
-# -----------------------------------------------------------------------------
-# 결과 저장 경로
-# -----------------------------------------------------------------------------
-RESULTS_DIR  = "results"
-RESULTS_CSV  = f"{RESULTS_DIR}/pg_results.csv"
-SQLITE_CSV   = f"{RESULTS_DIR}/sqlite_results.csv"
-REPORT_MD    = f"{RESULTS_DIR}/report.md"

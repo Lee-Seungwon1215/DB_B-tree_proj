@@ -136,5 +136,28 @@ def delete_record(conn, record_id: int):
     """, (record_id,))
 
 
+def sig_hash_query(conn, sig_hash: str) -> list:
+    """
+    서명 해시(sig_hash)로 단건 조회합니다.
+    idx_c_sig_hash 인덱스를 사용합니다.
+    """
+    return execute(conn, f"""
+        SELECT id, created_at, signer_id, algorithm
+        FROM {TABLE_NAME}
+        WHERE sig_hash = %s;
+    """, (sig_hash,), fetch=True)
+
+
+def get_sig_hashes(conn, record_ids: list) -> list:
+    """
+    주어진 id 목록에 해당하는 sig_hash 값들을 반환합니다.
+    """
+    rows = execute(conn, f"""
+        SELECT sig_hash FROM {TABLE_NAME}
+        WHERE id = ANY(%s);
+    """, (record_ids,), fetch=True)
+    return [row[0] for row in rows]
+
+
 def get_index_name(conn) -> str:
     return f"{TABLE_NAME}_pkey"

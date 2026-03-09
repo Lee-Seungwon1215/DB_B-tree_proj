@@ -89,9 +89,9 @@ def get_toast_size_bytes(conn, table_name: str) -> int:
     """
     try:
         result = execute(conn, f"""
-            SELECT
-                pg_total_relation_size('{table_name}') - pg_relation_size('{table_name}')
-            AS toast_size;
+            SELECT COALESCE(pg_relation_size(reltoastrelid), 0)
+            FROM pg_class
+            WHERE relname = '{table_name}';
         """, fetch=True)
         return result[0][0] if result else 0
     except Exception:

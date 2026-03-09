@@ -8,10 +8,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
+from config import RESULTS_CSV
 
 os.makedirs("results/graphs", exist_ok=True)
 
-df = pd.read_csv("results/results.csv")
+df = pd.read_csv(RESULTS_CSV)
 df["is_classical"] = df["family"] == "classical"
 
 # 색상 팔레트

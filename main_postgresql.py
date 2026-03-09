@@ -1,30 +1,22 @@
 # =============================================================================
 # main_postgresql.py - PostgreSQL 실험 자동 실행기 (실제 서명 방식)
 # =============================================================================
-# 알고리즘 × 전략 × 스케일 조합을 순차 실행합니다.
+# 알고리즘 × 전략 × 스케일 조합을 순차 실행하고 결과를 터미널에 출력합니다.
 #
 # 실행 방법:
-#   .venv/bin/python main_postgresql.py            → 전체 실험
-#   .venv/bin/python main_postgresql.py --resume   → 중단된 실험 이어서 실행
+#   .venv/bin/python main_postgresql.py                        → 전체 실험
 #   .venv/bin/python main_postgresql.py --algo ml-dsa-44 --strategy A
-#                                                  → 단일 실험
-#
-# 특징:
-#   - 서명 풀(pool) 방식: 사전 생성된 서명을 순환 사용 → DB 성능만 측정
-#   - 완료된 실험은 CSV에 기록되어 중단 후 재실행 시 건너뜀 (resume 기능)
-#   - 각 실험 후 테이블 DROP으로 디스크 공간 자동 반환
+#   .venv/bin/python main_postgresql.py --family classical
 # =============================================================================
 
-import os
 import sys
-import csv
 import argparse
 from datetime import datetime
 
-from config import ALGORITHMS, STRATEGIES, SCALES, RESULTS_CSV, RESULTS_DIR, SIG_POOL_SIZE
+from config import ALGORITHMS, STRATEGIES, SCALES, SIG_POOL_SIZE
 from data.generator import build_sig_pool, generate_records
 from db.postgresql.connection import get_connection, setup_extensions, execute
-from metrics.pg_collector import collect_all, reset_stats
+from metrics.pg_collector import collect_all, reset_stats, get_index_size_bytes
 
 import db.postgresql.strategy_a as strategy_a
 import db.postgresql.strategy_b as strategy_b
@@ -32,10 +24,11 @@ import db.postgresql.strategy_c as strategy_c
 import db.postgresql.strategy_d as strategy_d
 import db.postgresql.strategy_e as strategy_e
 
-from benchmark.insert      import run as run_insert
-from benchmark.point_query import run as run_point_query
-from benchmark.range_scan  import run as run_range_scan
-from benchmark.delete      import run as run_delete
+from benchmark.insert        import run as run_insert
+from benchmark.point_query   import run as run_point_query
+from benchmark.range_scan    import run as run_range_scan
+from benchmark.delete        import run as run_delete
+from benchmark.sig_hash_query import run as run_sig_hash_query
 
 STRATEGY_MODULES = {
     "A": strategy_a, "B": strategy_b, "C": strategy_c,
@@ -45,47 +38,55 @@ STRATEGY_MODULES = {
 # PostgreSQL TOAST 임계값 (2,040B 초과 시 TOAST 발동)
 TOAST_THRESHOLD = 2_040
 
-CSV_HEADERS = [
-    "db_type", "algorithm", "family", "level", "strategy", "scale",
-    "sig_size", "pk_size",
-    "overflow_expected", "overflow_pages_est",
-    "insert_total_sec", "insert_avg_ms", "insert_throughput_rps",
-    "pq_avg_ms", "pq_min_ms", "pq_max_ms", "pq_throughput_qps",
-    "rs_avg_ms", "rs_min_ms", "rs_max_ms", "rs_avg_results",
-    "del_avg_ms", "del_min_ms", "del_max_ms", "del_throughput_dps",
-    "btree_depth", "index_size_bytes", "table_size_bytes",
-    "toast_size_bytes", "index_page_count",
-    "cache_hit_ratio", "heap_reads", "heap_hits", "idx_reads", "idx_hits",
-    "timestamp",
-]
+
+def print_result(result: dict):
+    """실험 진행 중 단건 결과를 간략히 출력합니다."""
+    shq = (f"  SIG-HASH: {result['shq_avg_ms']:.3f}ms\n" if result['shq_avg_ms'] is not None else "")
+    print(f"\n{'─'*60}")
+    print(f"  결과: {result['algorithm']} | 전략 {result['strategy']} | {result['scale']:,}건")
+    print(f"{'─'*60}")
+    print(f"  INSERT  : {result['insert_throughput_rps']:>10,.0f} rps  (avg {result['insert_avg_ms']:.3f}ms)")
+    print(f"  POINT Q : {result['pq_avg_ms']:.3f}ms")
+    print(shq, end="")
+    print(f"  RANGE   : {result['rs_avg_ms']:.3f}ms  (avg {result['rs_avg_results']:.0f}건)")
+    print(f"  DELETE  : {result['del_avg_ms']:.3f}ms")
+    print(f"  B+tree 깊이: {result['btree_depth']}  |  TOAST: {result['toast_size_bytes']:,}B  |  캐시: {result['cache_hit_ratio']:.4f}")
 
 
-def load_completed() -> set:
-    completed = set()
-    if not os.path.exists(RESULTS_CSV):
-        return completed
-    with open(RESULTS_CSV, "r") as f:
-        for row in csv.DictReader(f):
-            completed.add((row["algorithm"], row["strategy"], row["scale"]))
-    return completed
-
-
-def save_result(result: dict):
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    file_exists = os.path.exists(RESULTS_CSV)
-    with open(RESULTS_CSV, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(result)
+def print_markdown_table(results: list):
+    """모든 실험 결과를 마크다운 테이블로 출력합니다."""
+    print("\n\n" + "="*60)
+    print("## PostgreSQL 실험 결과\n")
+    print("| Algorithm | Family | Level | Strategy | Sig(B) | INSERT(rps) | PQ(ms) | SHQ(ms) | Range(ms) | Del(ms) | B+tree Depth | Table(MB) | Index(MB) | SHQ-Idx(MB) | TOAST(MB) | Cache Hit |")
+    print("|-----------|--------|-------|----------|--------|-------------|--------|---------|-----------|---------|-------------|-----------|-----------|-------------|-----------|-----------|")
+    for r in results:
+        shq     = f"{r['shq_avg_ms']:.3f}" if r['shq_avg_ms'] is not None else "-"
+        shq_idx = (f"{r['sighash_index_size_bytes']/1024/1024:.1f}"
+                   if r['sighash_index_size_bytes'] is not None else "-")
+        print(
+            f"| {r['algorithm']} "
+            f"| {r['family']} "
+            f"| {r['level']} "
+            f"| {r['strategy']} "
+            f"| {r['sig_size']:,} "
+            f"| {r['insert_throughput_rps']:,.0f} "
+            f"| {r['pq_avg_ms']:.3f} "
+            f"| {shq} "
+            f"| {r['rs_avg_ms']:.3f} "
+            f"| {r['del_avg_ms']:.3f} "
+            f"| {r['btree_depth']} "
+            f"| {r['table_size_bytes']/1024/1024:.1f} "
+            f"| {r['index_size_bytes']/1024/1024:.1f} "
+            f"| {shq_idx} "
+            f"| {r['toast_size_bytes']/1024/1024:.1f} "
+            f"| {r['cache_hit_ratio']:.4f} |"
+        )
+    print()
 
 
 def run_single_experiment(conn, algorithm_name: str, strategy_key: str,
                           scale: int, sig_pool: list) -> dict:
-    """
-    단일 실험 1회를 실행합니다.
-    (테이블 생성 → INSERT → ANALYZE → 측정 → DROP)
-    """
+    """단일 실험 1회 실행 (테이블 생성 → INSERT → ANALYZE → 측정 → DROP)"""
     algo_info       = ALGORITHMS[algorithm_name]
     strategy_module = STRATEGY_MODULES[strategy_key]
 
@@ -93,43 +94,41 @@ def run_single_experiment(conn, algorithm_name: str, strategy_key: str,
     print(f"실험: {algorithm_name} | 전략 {strategy_key} | {scale:,}건 | PostgreSQL")
     print(f"{'='*60}")
 
-    # 1. 테이블 생성
     strategy_module.create_table(conn)
     print("  테이블 생성 완료")
 
-    # 2. 통계 초기화
     reset_stats(conn)
 
-    # 3. INSERT 벤치마크 (서명 풀에서 순환 사용)
     records_gen  = generate_records(algorithm_name, scale, sig_pool=sig_pool)
     insert_result = run_insert(conn, strategy_module, algorithm_name, records_gen)
     inserted_ids  = insert_result.pop("inserted_ids")
 
-    # 4. ANALYZE
     main_table = (strategy_module.TABLE_NAME
                   if hasattr(strategy_module, "TABLE_NAME")
                   else strategy_module.MAIN_TABLE)
     execute(conn, f"ANALYZE {main_table};")
     print("  ANALYZE 완료")
 
-    # 5. 메트릭 수집
     index_name = strategy_module.get_index_name(conn)
     metrics    = collect_all(conn, main_table, index_name)
 
-    # 6. Point Query
+    sighash_index_size = (get_index_size_bytes(conn, strategy_c.INDEX_SIGHASH)
+                          if strategy_key == "C" else None)
+
     pq_result = run_point_query(conn, strategy_module, inserted_ids)
 
-    # 7. Range Scan
-    rs_result = run_range_scan(conn, strategy_module, algorithm_name, scale)
+    if strategy_key == "C":
+        shq_result = run_sig_hash_query(conn, strategy_module, inserted_ids)
+    else:
+        shq_result = {"avg_latency_ms": None, "min_latency_ms": None,
+                      "max_latency_ms": None, "throughput_qps": None}
 
-    # 8. Delete
+    rs_result  = run_range_scan(conn, strategy_module, algorithm_name, scale)
     del_result = run_delete(conn, strategy_module, inserted_ids)
 
-    # 9. DROP
     strategy_module.drop_table(conn)
     print("  테이블 삭제 완료")
 
-    # 결과 통합
     sig_size = algo_info["sig_size"]
     overflow_expected  = sig_size > TOAST_THRESHOLD
     overflow_pages_est = (max(0, (sig_size - TOAST_THRESHOLD) // 8192 + 1)
@@ -149,10 +148,14 @@ def run_single_experiment(conn, algorithm_name: str, strategy_key: str,
         "insert_total_sec":      insert_result["total_time_sec"],
         "insert_avg_ms":         insert_result["avg_latency_ms"],
         "insert_throughput_rps": insert_result["throughput_rps"],
-        "pq_avg_ms":       pq_result["avg_latency_ms"],
-        "pq_min_ms":       pq_result["min_latency_ms"],
-        "pq_max_ms":       pq_result["max_latency_ms"],
+        "pq_avg_ms":         pq_result["avg_latency_ms"],
+        "pq_min_ms":         pq_result["min_latency_ms"],
+        "pq_max_ms":         pq_result["max_latency_ms"],
         "pq_throughput_qps": pq_result["throughput_qps"],
+        "shq_avg_ms":         shq_result["avg_latency_ms"],
+        "shq_min_ms":         shq_result["min_latency_ms"],
+        "shq_max_ms":         shq_result["max_latency_ms"],
+        "shq_throughput_qps": shq_result["throughput_qps"],
         "rs_avg_ms":      rs_result["avg_latency_ms"],
         "rs_min_ms":      rs_result["min_latency_ms"],
         "rs_max_ms":      rs_result["max_latency_ms"],
@@ -162,7 +165,8 @@ def run_single_experiment(conn, algorithm_name: str, strategy_key: str,
         "del_max_ms":         del_result["max_latency_ms"],
         "del_throughput_dps": del_result["throughput_dps"],
         "btree_depth":      metrics["btree_depth"],
-        "index_size_bytes": metrics["index_size_bytes"],
+        "index_size_bytes":        metrics["index_size_bytes"],
+        "sighash_index_size_bytes": sighash_index_size,
         "table_size_bytes": metrics["table_size_bytes"],
         "toast_size_bytes": metrics["toast_size_bytes"],
         "index_page_count": metrics["index_page_count"],
@@ -177,57 +181,50 @@ def run_single_experiment(conn, algorithm_name: str, strategy_key: str,
 
 def main():
     parser = argparse.ArgumentParser(description="PQC DB 성능 실험 - PostgreSQL")
-    parser.add_argument("--resume",   action="store_true", help="중단된 실험 이어서 실행")
-    parser.add_argument("--algo",     type=str, help="단일 알고리즘만 실험")
-    parser.add_argument("--family",   type=str, help="계열만 실험 (classical/aimer/haetae/ml-dsa/sphincs)")
-    parser.add_argument("--strategy", type=str, help="단일 전략만 실험")
+    parser.add_argument("--algo",      type=str, help="단일 알고리즘만 실험")
+    parser.add_argument("--family",    type=str, help="계열만 실험 (classical/aimer/haetae/ml-dsa/sphincs)")
+    parser.add_argument("--strategy",  type=str, help="단일 전략만 실험")
     parser.add_argument("--pool-size", type=int, default=SIG_POOL_SIZE,
                         help=f"서명 풀 크기 (기본값: {SIG_POOL_SIZE})")
     args = parser.parse_args()
 
-    # 실험 대상 결정
     if args.algo:
         algos = [args.algo]
     elif args.family:
         algos = [k for k, v in ALGORITHMS.items() if v["family"] == args.family]
     else:
         algos = list(ALGORITHMS.keys())
-    strategies = [args.strategy] if args.strategy else STRATEGIES
+    def get_strategies(algo_name: str) -> list:
+        if args.strategy:
+            return [args.strategy]
+        if ALGORITHMS[algo_name]["family"] == "classical":
+            return ["A"]
+        return STRATEGIES
 
-    total = len(algos) * len(strategies) * len(SCALES)
+    total = sum(len(get_strategies(a)) * len(SCALES) for a in algos)
     print(f"PQC DB 성능 실험 - PostgreSQL (실제 서명 방식)")
-    print(f"총 실험: {len(algos)} 알고리즘 × {len(strategies)} 전략 × {len(SCALES)} 스케일 = {total}회")
+    print(f"총 실험: {total}회 (classical=전략A만, PQC=전략A~E)")
     print(f"서명 풀 크기: {args.pool_size}개")
-
-    completed = load_completed() if args.resume else set()
-    if completed:
-        print(f"이미 완료된 실험: {len(completed)}회 (건너뜀)")
 
     conn = get_connection()
     setup_extensions(conn)
 
     done = 0
-    skipped = 0
+    all_results = []
 
     for algorithm_name in algos:
-        # 알고리즘별 서명 풀 생성 (전략/스케일 루프 전에 한 번만)
         sig_pool = build_sig_pool(algorithm_name, pool_size=args.pool_size)
 
-        for strategy_key in strategies:
+        for strategy_key in get_strategies(algorithm_name):
             for scale in SCALES:
-                exp_key = (algorithm_name, strategy_key, str(scale))
-                if exp_key in completed:
-                    skipped += 1
-                    continue
-
                 try:
                     result = run_single_experiment(
                         conn, algorithm_name, strategy_key, scale, sig_pool
                     )
-                    save_result(result)
+                    print_result(result)
+                    all_results.append(result)
                     done += 1
-                    progress = (done + skipped) / total * 100
-                    print(f"\n진행률: {progress:.1f}% ({done + skipped}/{total})\n")
+                    print(f"\n진행률: {done/total*100:.1f}% ({done}/{total})\n")
 
                 except Exception as e:
                     print(f"\n[오류] {algorithm_name} / 전략{strategy_key} / {scale:,}건: {e}")
@@ -239,8 +236,9 @@ def main():
                         pass
 
     conn.close()
-    print(f"\n{'='*60}")
-    print(f"완료! 결과: {RESULTS_CSV}")
+    print_markdown_table(all_results)
+    print(f"{'='*60}")
+    print(f"완료! 총 {done}회 실험")
     print(f"{'='*60}")
 
 
