@@ -23,6 +23,8 @@ from config import (
 )
 from data.generator import build_sig_pool
 from metrics.sqlite_collector import collect_all as sqlite_collect_all
+import db.sqlite.strategy_a as strategy_a
+import db.sqlite.strategy_b as strategy_b
 
 # =============================================================================
 # 설정
@@ -36,6 +38,8 @@ INSERT_BATCH_SIZE  = 500
 VALID_BENCHES    = {"si", "bulk", "pq", "range", "update", "del", "rdel"}
 BENCH_NEEDS_DATA = {"pq", "range", "update", "del", "rdel"}
 
+STRATEGY_MODULES = {"A": strategy_a, "B": strategy_b}
+
 # =============================================================================
 # 테이블 이름
 # =============================================================================
@@ -44,50 +48,18 @@ def tname(algo: str, strategy: str) -> str:
     safe = algo.replace("-", "_").replace("+", "p")
     return f"sq_{safe}_{strategy}"
 
-# =============================================================================
-# 전략별 테이블 생성 / 삭제
-# =============================================================================
-
-def create_table(conn, table: str, strategy: str):
-    conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS {table} (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            entity_id  TEXT NOT NULL,
-            public_key BLOB NOT NULL,
-            signature  BLOB NOT NULL,
-            created_at TEXT DEFAULT (datetime('now'))
-        )""")
-    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_e ON {table}(entity_id)")
-    conn.commit()
-
-
-def drop_table(conn, table: str, strategy: str):
-    conn.execute(f"DROP TABLE IF EXISTS {table}")
-    conn.commit()
-
-# =============================================================================
-# 전략별 배치 INSERT
-# =============================================================================
-
-def insert_batch(conn, table: str, strategy: str, batch: list):
-    """batch: list of (entity_id, public_key, signature)"""
-    conn.executemany(
-        f"INSERT INTO {table}(entity_id,public_key,signature) VALUES(?,?,?)", batch)
-    conn.commit()
 
 # =============================================================================
 # 벤치마크
 # =============================================================================
 
-def measure_point_query(conn, table: str, strategy: str, entity_ids: list) -> dict:
+def measure_point_query(conn, table: str, strategy_module, entity_ids: list) -> dict:
     sample = random.choices(entity_ids, k=POINT_QUERY_COUNT)
     latencies = []
-    cur = conn.cursor()
 
     for eid in sample:
         t0 = time.perf_counter()
-        cur.execute(f"SELECT * FROM {table} WHERE entity_id=?", (eid,))
-        cur.fetchone()
+        strategy_module.point_query(conn, table, eid)
         latencies.append((time.perf_counter() - t0) * 1000)
 
     avg = sum(latencies) / len(latencies)
@@ -99,19 +71,17 @@ def measure_point_query(conn, table: str, strategy: str, entity_ids: list) -> di
     }
 
 
-def measure_range_scan(conn, table: str, strategy: str, scale: int) -> dict:
+def measure_range_scan(conn, table: str, strategy_module, scale: int) -> dict:
     limit = int(scale * RANGE_RATIO)
     latencies = []
     result_counts = []
-    cur = conn.cursor()
 
     for _ in range(RANGE_SCAN_COUNT):
         offset = random.randint(0, max(0, scale - limit))
         t0 = time.perf_counter()
-        cur.execute(f"SELECT * FROM {table} ORDER BY id LIMIT ? OFFSET ?", (limit, offset))
-        rows = cur.fetchall()
+        rows = strategy_module.range_scan(conn, table, limit, offset)
         latencies.append((time.perf_counter() - t0) * 1000)
-        result_counts.append(len(rows))
+        result_counts.append(len(rows) if rows else 0)
 
     return {
         "rs_avg_ms":      round(sum(latencies) / len(latencies), 4),
@@ -121,7 +91,7 @@ def measure_range_scan(conn, table: str, strategy: str, scale: int) -> dict:
     }
 
 
-def measure_update(conn, table: str, strategy: str, entity_ids: list, sig_pool: list) -> dict:
+def measure_update(conn, table: str, strategy_module, entity_ids: list, sig_pool: list) -> dict:
     targets = random.sample(entity_ids, min(UPDATE_COUNT, len(entity_ids)))
     pool_sz  = len(sig_pool)
     latencies = []
@@ -132,10 +102,7 @@ def measure_update(conn, table: str, strategy: str, entity_ids: list, sig_pool: 
         pk, sig, _ = sig_pool[i % pool_sz]
 
         t0 = time.perf_counter()
-        conn.execute(
-            f"UPDATE {table} SET public_key=?, signature=? WHERE entity_id=?",
-            (pk, sig, eid))
-        conn.commit()
+        strategy_module.update_record(conn, table, eid, pk, sig)
         latencies.append((time.perf_counter() - t0) * 1000)
 
     avg = sum(latencies) / len(latencies)
@@ -149,7 +116,7 @@ def measure_update(conn, table: str, strategy: str, entity_ids: list, sig_pool: 
     }
 
 
-def measure_single_insert(conn, table: str, strategy: str, sig_pool: list) -> dict:
+def measure_single_insert(conn, table: str, strategy_module, sig_pool: list) -> dict:
     count   = min(SINGLE_INSERT_COUNT, len(sig_pool))
     pool_sz = len(sig_pool)
     latencies = []
@@ -161,18 +128,15 @@ def measure_single_insert(conn, table: str, strategy: str, sig_pool: list) -> di
         entity_id  = f"__si_{i}__"
 
         t0 = time.perf_counter()
-        conn.execute(
-            f"INSERT INTO {table}(entity_id, public_key, signature) VALUES(?, ?, ?)",
-            (entity_id, pk, sig))
-        conn.commit()
+        strategy_module.insert_single(conn, table, entity_id, pk, sig)
         latencies.append((time.perf_counter() - t0) * 1000)
 
     avg = sum(latencies) / len(latencies)
     print(f"  [SINGLE INSERT] 완료: 평균 {avg:.3f}ms")
 
     # 측정용 레코드 정리 (이후 범위INS를 빈 테이블에서 시작하기 위해)
-    conn.execute(f"DELETE FROM {table} WHERE entity_id LIKE '__si_%'")
-    conn.commit()
+    temp_ids = [f"__si_{i}__" for i in range(count)]
+    strategy_module.range_delete_records(conn, table, temp_ids)
     print(f"  [SINGLE INSERT] 임시 레코드 {count}건 정리 완료")
 
     return {
@@ -183,14 +147,13 @@ def measure_single_insert(conn, table: str, strategy: str, sig_pool: list) -> di
     }
 
 
-def measure_range_delete(conn, table: str, strategy: str, entity_ids: list) -> dict:
+def measure_range_delete(conn, table: str, strategy_module, entity_ids: list) -> dict:
     needed = RANGE_DELETE_COUNT * RANGE_DELETE_REPEAT
     repeat = RANGE_DELETE_REPEAT if len(entity_ids) >= needed else max(1, len(entity_ids) // RANGE_DELETE_COUNT)
     count  = RANGE_DELETE_COUNT
 
     # 겹치지 않도록 pool을 셔플 후 슬라이스
     pool = random.sample(entity_ids, min(count * repeat, len(entity_ids)))
-    placeholders = ",".join(["?"] * count)
 
     print(f"  [RANGE DELETE] {count}건 × {repeat}회 일괄 삭제 시작...")
 
@@ -199,8 +162,7 @@ def measure_range_delete(conn, table: str, strategy: str, entity_ids: list) -> d
     for i in range(repeat):
         targets = pool[i * count : (i + 1) * count]
         t0 = time.perf_counter()
-        conn.execute(f"DELETE FROM {table} WHERE entity_id IN ({placeholders})", targets)
-        conn.commit()
+        strategy_module.range_delete_records(conn, table, targets)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         per_record_latencies.append(elapsed_ms / len(targets))
 
@@ -215,14 +177,13 @@ def measure_range_delete(conn, table: str, strategy: str, entity_ids: list) -> d
     }
 
 
-def measure_delete(conn, table: str, strategy: str, entity_ids: list) -> dict:
+def measure_delete(conn, table: str, strategy_module, entity_ids: list) -> dict:
     targets = random.sample(entity_ids, min(DELETE_COUNT, len(entity_ids)))
     latencies = []
 
     for eid in targets:
         t0 = time.perf_counter()
-        conn.execute(f"DELETE FROM {table} WHERE entity_id=?", (eid,))
-        conn.commit()
+        strategy_module.delete_record(conn, table, eid)
         latencies.append((time.perf_counter() - t0) * 1000)
 
     total_ms = sum(latencies)
@@ -294,9 +255,10 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
     needs_data = bool(benches & BENCH_NEEDS_DATA)
     needs_bulk = "bulk" in benches or needs_data
 
-    table    = tname(algo_name, strategy)
-    pool_sz  = len(sig_pool)
-    sig_size = algo_info["sig_size"]
+    table           = tname(algo_name, strategy)
+    strategy_module = STRATEGY_MODULES[strategy]
+    pool_sz         = len(sig_pool)
+    sig_size        = algo_info["sig_size"]
 
     print(f"\n{'='*60}")
     print(f"실험: {algo_name} | 전략 {strategy} | {scale:,}건 | SQLite")
@@ -321,10 +283,10 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
                  "page_size": SQLITE_PAGE_SIZE}
 
     try:
-        create_table(conn, table, strategy)
+        strategy_module.create_table(conn, table)
 
         # 단건INS: 빈 테이블에서 먼저 측정 후 정리
-        si = measure_single_insert(conn, table, strategy, sig_pool) if "si" in benches else _zero_si
+        si = measure_single_insert(conn, table, strategy_module, sig_pool) if "si" in benches else _zero_si
 
         # 범위INS: 1M 레코드 적재
         entity_ids = []
@@ -338,28 +300,27 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
                 batch.append((entity_id, pk, sig))
                 entity_ids.append(entity_id)
                 if len(batch) == INSERT_BATCH_SIZE:
-                    insert_batch(conn, table, strategy, batch)
+                    strategy_module.insert_batch(conn, table, batch)
                     batch = []
             if batch:
-                insert_batch(conn, table, strategy, batch)
+                strategy_module.insert_batch(conn, table, batch)
             insert_sec = time.perf_counter() - t0
             print(f"  [INSERT] 완료: {scale:,}건 / {insert_sec:.2f}초")
 
         if needs_data:
-            conn.execute(f"ANALYZE {table}")
-            conn.commit()
+            strategy_module.analyze(conn, table)
             print("  ANALYZE 완료")
-            metrics = sqlite_collect_all(conn, table, f"idx_{table}_e")
+            metrics = sqlite_collect_all(conn, strategy_module.get_main_table(table), strategy_module.get_index_name(table))
         else:
             metrics = _zero_m
 
-        pq  = measure_point_query(conn, table, strategy, entity_ids)  if "pq"     in benches and entity_ids else _zero_pq
-        rs  = measure_range_scan(conn, table, strategy, scale)        if "range"  in benches and entity_ids else _zero_rs
-        upd = measure_update(conn, table, strategy, entity_ids, sig_pool) if "update" in benches and entity_ids else _zero_upd
-        dl  = measure_delete(conn, table, strategy, entity_ids)       if "del"    in benches and entity_ids else _zero_dl
-        rd  = measure_range_delete(conn, table, strategy, entity_ids) if "rdel"   in benches and entity_ids else _zero_rd
+        pq  = measure_point_query(conn, table, strategy_module, entity_ids)  if "pq"     in benches and entity_ids else _zero_pq
+        rs  = measure_range_scan(conn, table, strategy_module, scale)        if "range"  in benches and entity_ids else _zero_rs
+        upd = measure_update(conn, table, strategy_module, entity_ids, sig_pool) if "update" in benches and entity_ids else _zero_upd
+        dl  = measure_delete(conn, table, strategy_module, entity_ids)       if "del"    in benches and entity_ids else _zero_dl
+        rd  = measure_range_delete(conn, table, strategy_module, entity_ids) if "rdel"   in benches and entity_ids else _zero_rd
 
-        drop_table(conn, table, strategy)
+        strategy_module.drop_table(conn, table)
         print("  테이블 삭제 완료")
 
     except Exception as e:
@@ -367,7 +328,7 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
         print(f"[오류] {e}")
         traceback.print_exc()
         try:
-            drop_table(conn, table, strategy)
+            strategy_module.drop_table(conn, table)
         except Exception:
             pass
         conn.close()

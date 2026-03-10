@@ -19,6 +19,7 @@ from db.postgresql.connection import get_connection, setup_extensions, execute
 from metrics.pg_collector import collect_all, reset_stats
 
 import db.postgresql.strategy_a as strategy_a
+import db.postgresql.strategy_b as strategy_b #수직 파티셔닝 추가햇어요
 
 from benchmark.insert        import run as run_insert
 from benchmark.single_insert import run as run_single_insert
@@ -28,7 +29,7 @@ from benchmark.update        import run as run_update
 from benchmark.delete        import run as run_delete
 from benchmark.range_delete  import run as run_range_delete
 
-STRATEGY_MODULES = {"A": strategy_a}
+STRATEGY_MODULES = {"A": strategy_a, "B": strategy_b} #B전략 추가
 
 # PostgreSQL TOAST 임계값 (2,040B 초과 시 TOAST 발동)
 TOAST_THRESHOLD = 2_040
