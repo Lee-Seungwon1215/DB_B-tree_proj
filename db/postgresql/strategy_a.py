@@ -110,6 +110,17 @@ def range_scan(conn, start_time, end_time) -> list:
     """, (start_time, end_time), fetch=True)
 
 
+def update_record(conn, record_id: int, public_key: bytes, signature: bytes):
+    """
+    고유번호(id)로 공개키와 서명을 갱신합니다. (키 교체 시나리오)
+    """
+    execute(conn, f"""
+        UPDATE {TABLE_NAME}
+        SET public_key = %s, signature = %s
+        WHERE id = %s;
+    """, (public_key, signature, record_id))
+
+
 def delete_record(conn, record_id: int):
     """
     고유번호(id)로 레코드 1건을 삭제합니다.
@@ -117,6 +128,17 @@ def delete_record(conn, record_id: int):
     execute(conn, f"""
         DELETE FROM {TABLE_NAME} WHERE id = %s;
     """, (record_id,))
+
+
+def range_delete_records(conn, record_ids: list):
+    """
+    고유번호(id) 목록에 해당하는 레코드를 단일 쿼리로 일괄 삭제합니다.
+    """
+    if not record_ids:
+        return
+    placeholders = ",".join(["%s"] * len(record_ids))
+    execute(conn, f"DELETE FROM {TABLE_NAME} WHERE id IN ({placeholders});",
+            tuple(record_ids))
 
 
 def get_index_name(conn) -> str:
