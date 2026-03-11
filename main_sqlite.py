@@ -27,6 +27,7 @@ from data.generator import build_sig_pool
 import db.sqlite.strategy_a as strategy_a
 import db.sqlite.strategy_b as strategy_b
 import db.sqlite.strategy_c as strategy_c
+import db.sqlite.strategy_d as strategy_d
 
 # =============================================================================
 # 설정
@@ -37,6 +38,7 @@ STRATEGY_MODULES = {
     "A": strategy_a,
     "B": strategy_b,
     "C": strategy_c,
+    "D": strategy_d,
 }
 
 SQLITE_DB_PATH    = "sqlite_benchmark.db"
