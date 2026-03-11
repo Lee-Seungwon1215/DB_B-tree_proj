@@ -9,6 +9,7 @@
 #   .venv/bin/python main_sqlite.py --family classical
 # =============================================================================
 
+import os
 import time
 import random
 import hashlib
@@ -17,28 +18,32 @@ import argparse
 from datetime import datetime
 
 from config import (
-    ALGORITHMS, STRATEGIES, SCALES, SIG_POOL_SIZE,
+    ALGORITHMS, SCALES, SIG_POOL_SIZE,
     POINT_QUERY_COUNT, RANGE_SCAN_COUNT, DELETE_COUNT, UPDATE_COUNT,
     SINGLE_INSERT_COUNT, RANGE_DELETE_COUNT, RANGE_DELETE_REPEAT, RANGE_RATIO,
 )
 from data.generator import build_sig_pool
-from metrics.sqlite_collector import collect_all as sqlite_collect_all
+
 import db.sqlite.strategy_a as strategy_a
 import db.sqlite.strategy_b as strategy_b
+import db.sqlite.strategy_c as strategy_c
 
 # =============================================================================
 # 설정
 # =============================================================================
 
-SQLITE_PAGE_SIZE   = 4096
-OVERFLOW_THRESHOLD = SQLITE_PAGE_SIZE // 4   # 1,024B
-SQLITE_DB_PATH     = "sqlite_benchmark.db"
-INSERT_BATCH_SIZE  = 500
+# 전략별 모듈: A=4KB 인라인, B=64KB 인라인, C=4KB 수직 파티셔닝
+STRATEGY_MODULES = {
+    "A": strategy_a,
+    "B": strategy_b,
+    "C": strategy_c,
+}
+
+SQLITE_DB_PATH    = "sqlite_benchmark.db"
+INSERT_BATCH_SIZE = 500
 
 VALID_BENCHES    = {"si", "bulk", "pq", "range", "update", "del", "rdel"}
 BENCH_NEEDS_DATA = {"pq", "range", "update", "del", "rdel"}
-
-STRATEGY_MODULES = {"A": strategy_a, "B": strategy_b}
 
 # =============================================================================
 # 테이블 이름
@@ -48,18 +53,17 @@ def tname(algo: str, strategy: str) -> str:
     safe = algo.replace("-", "_").replace("+", "p")
     return f"sq_{safe}_{strategy}"
 
-
 # =============================================================================
 # 벤치마크
 # =============================================================================
 
-def measure_point_query(conn, table: str, strategy_module, entity_ids: list) -> dict:
+def measure_point_query(conn, table: str, mod, entity_ids: list) -> dict:
     sample = random.choices(entity_ids, k=POINT_QUERY_COUNT)
     latencies = []
 
     for eid in sample:
         t0 = time.perf_counter()
-        strategy_module.point_query(conn, table, eid)
+        mod.point_query(conn, table, eid)
         latencies.append((time.perf_counter() - t0) * 1000)
 
     avg = sum(latencies) / len(latencies)
@@ -71,7 +75,7 @@ def measure_point_query(conn, table: str, strategy_module, entity_ids: list) -> 
     }
 
 
-def measure_range_scan(conn, table: str, strategy_module, scale: int) -> dict:
+def measure_range_scan(conn, table: str, mod, scale: int) -> dict:
     limit = int(scale * RANGE_RATIO)
     latencies = []
     result_counts = []
@@ -79,9 +83,9 @@ def measure_range_scan(conn, table: str, strategy_module, scale: int) -> dict:
     for _ in range(RANGE_SCAN_COUNT):
         offset = random.randint(0, max(0, scale - limit))
         t0 = time.perf_counter()
-        rows = strategy_module.range_scan(conn, table, limit, offset)
+        rows = mod.range_scan(conn, table, limit, offset)
         latencies.append((time.perf_counter() - t0) * 1000)
-        result_counts.append(len(rows) if rows else 0)
+        result_counts.append(len(rows))
 
     return {
         "rs_avg_ms":      round(sum(latencies) / len(latencies), 4),
@@ -91,7 +95,7 @@ def measure_range_scan(conn, table: str, strategy_module, scale: int) -> dict:
     }
 
 
-def measure_update(conn, table: str, strategy_module, entity_ids: list, sig_pool: list) -> dict:
+def measure_update(conn, table: str, mod, entity_ids: list, sig_pool: list) -> dict:
     targets = random.sample(entity_ids, min(UPDATE_COUNT, len(entity_ids)))
     pool_sz  = len(sig_pool)
     latencies = []
@@ -100,9 +104,8 @@ def measure_update(conn, table: str, strategy_module, entity_ids: list, sig_pool
 
     for i, eid in enumerate(targets):
         pk, sig, _ = sig_pool[i % pool_sz]
-
         t0 = time.perf_counter()
-        strategy_module.update_record(conn, table, eid, pk, sig)
+        mod.update_record(conn, table, eid, pk, sig)
         latencies.append((time.perf_counter() - t0) * 1000)
 
     avg = sum(latencies) / len(latencies)
@@ -116,7 +119,7 @@ def measure_update(conn, table: str, strategy_module, entity_ids: list, sig_pool
     }
 
 
-def measure_single_insert(conn, table: str, strategy_module, sig_pool: list) -> dict:
+def measure_single_insert(conn, table: str, mod, sig_pool: list) -> dict:
     count   = min(SINGLE_INSERT_COUNT, len(sig_pool))
     pool_sz = len(sig_pool)
     latencies = []
@@ -126,17 +129,17 @@ def measure_single_insert(conn, table: str, strategy_module, sig_pool: list) -> 
     for i in range(count):
         pk, sig, _ = sig_pool[i % pool_sz]
         entity_id  = f"__si_{i}__"
-
         t0 = time.perf_counter()
-        strategy_module.insert_single(conn, table, entity_id, pk, sig)
+        mod.insert_single(conn, table, entity_id, pk, sig)
         latencies.append((time.perf_counter() - t0) * 1000)
 
     avg = sum(latencies) / len(latencies)
     print(f"  [SINGLE INSERT] 완료: 평균 {avg:.3f}ms")
 
-    # 측정용 레코드 정리 (이후 범위INS를 빈 테이블에서 시작하기 위해)
-    temp_ids = [f"__si_{i}__" for i in range(count)]
-    strategy_module.range_delete_records(conn, table, temp_ids)
+    # 측정용 레코드 정리
+    main_table = mod.get_main_table(table)
+    conn.execute(f"DELETE FROM {main_table} WHERE entity_id LIKE '__si_%'")
+    conn.commit()
     print(f"  [SINGLE INSERT] 임시 레코드 {count}건 정리 완료")
 
     return {
@@ -147,12 +150,11 @@ def measure_single_insert(conn, table: str, strategy_module, sig_pool: list) -> 
     }
 
 
-def measure_range_delete(conn, table: str, strategy_module, entity_ids: list) -> dict:
+def measure_range_delete(conn, table: str, mod, entity_ids: list) -> dict:
     needed = RANGE_DELETE_COUNT * RANGE_DELETE_REPEAT
     repeat = RANGE_DELETE_REPEAT if len(entity_ids) >= needed else max(1, len(entity_ids) // RANGE_DELETE_COUNT)
     count  = RANGE_DELETE_COUNT
 
-    # 겹치지 않도록 pool을 셔플 후 슬라이스
     pool = random.sample(entity_ids, min(count * repeat, len(entity_ids)))
 
     print(f"  [RANGE DELETE] {count}건 × {repeat}회 일괄 삭제 시작...")
@@ -162,7 +164,7 @@ def measure_range_delete(conn, table: str, strategy_module, entity_ids: list) ->
     for i in range(repeat):
         targets = pool[i * count : (i + 1) * count]
         t0 = time.perf_counter()
-        strategy_module.range_delete_records(conn, table, targets)
+        mod.range_delete_records(conn, table, targets)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         per_record_latencies.append(elapsed_ms / len(targets))
 
@@ -177,13 +179,13 @@ def measure_range_delete(conn, table: str, strategy_module, entity_ids: list) ->
     }
 
 
-def measure_delete(conn, table: str, strategy_module, entity_ids: list) -> dict:
+def measure_delete(conn, table: str, mod, entity_ids: list) -> dict:
     targets = random.sample(entity_ids, min(DELETE_COUNT, len(entity_ids)))
     latencies = []
 
     for eid in targets:
         t0 = time.perf_counter()
-        strategy_module.delete_record(conn, table, eid)
+        mod.delete_record(conn, table, eid)
         latencies.append((time.perf_counter() - t0) * 1000)
 
     total_ms = sum(latencies)
@@ -200,7 +202,6 @@ def measure_delete(conn, table: str, strategy_module, entity_ids: list) -> dict:
 # =============================================================================
 
 def print_result(result: dict):
-    """실험 진행 중 단건 결과를 간략히 출력합니다."""
     print(f"\n{'─'*60}")
     print(f"  결과: {result['algorithm']} | 전략 {result['strategy']} | {result['scale']:,}건")
     print(f"{'─'*60}")
@@ -215,7 +216,6 @@ def print_result(result: dict):
 
 
 def print_markdown_table(results: list):
-    """모든 실험 결과를 마크다운 테이블로 출력합니다."""
     print("\n\n" + "="*60)
     print("## SQLite 실험 결과\n")
     print("| Algorithm | Family | Level | Strategy | Sig(B) | 범위INS(rps) | 단건INS(ms) | PQ(ms) | Range(ms) | Update(ms) | 단건DEL(ms) | 범위DEL(ms/건) | B+tree Depth | Table(MB) | Overflow(MB) | Leaf Pages | Overflow Pages |")
@@ -255,21 +255,31 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
     needs_data = bool(benches & BENCH_NEEDS_DATA)
     needs_bulk = "bulk" in benches or needs_data
 
-    table           = tname(algo_name, strategy)
-    strategy_module = STRATEGY_MODULES[strategy]
-    pool_sz         = len(sig_pool)
-    sig_size        = algo_info["sig_size"]
+    mod      = STRATEGY_MODULES[strategy]
+    table    = tname(algo_name, strategy)
+    pool_sz  = len(sig_pool)
+    sig_size = algo_info["sig_size"]
+
+    page_size          = mod.PAGE_SIZE
+    overflow_threshold = page_size // 4
+    cache_kib          = (page_size // 4096) * 65536   # 4KB→64MB, 64KB→256MB
 
     print(f"\n{'='*60}")
-    print(f"실험: {algo_name} | 전략 {strategy} | {scale:,}건 | SQLite")
+    print(f"실험: {algo_name} | 전략 {strategy} | {scale:,}건 | SQLite (page={page_size}B)")
     print(f"벤치마크: {', '.join(sorted(benches))}")
     print(f"{'='*60}")
 
+    # page_size는 DB 파일 생성 시에만 적용되므로 매 실험 전 삭제 (WAL/SHM 포함)
+    for ext in ["", "-wal", "-shm"]:
+        path = SQLITE_DB_PATH + ext
+        if os.path.exists(path):
+            os.remove(path)
+
     conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn.execute(f"PRAGMA page_size={page_size}")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute(f"PRAGMA page_size={SQLITE_PAGE_SIZE}")
-    conn.execute("PRAGMA cache_size=-65536")
+    conn.execute(f"PRAGMA cache_size=-{cache_kib}")
 
     _zero_si  = {"si_avg_ms": 0, "si_min_ms": 0, "si_max_ms": 0, "si_throughput_rps": 0}
     _zero_pq  = {"pq_avg_ms": 0, "pq_min_ms": 0, "pq_max_ms": 0, "pq_throughput_qps": 0}
@@ -280,13 +290,13 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
     _zero_m   = {"btree_depth": 0, "index_size_bytes": 0, "table_size_bytes": 0,
                  "toast_size_bytes": 0, "leaf_page_count": 0,
                  "internal_page_count": 0, "overflow_page_count": 0,
-                 "page_size": SQLITE_PAGE_SIZE}
+                 "page_size": page_size}
 
     try:
-        strategy_module.create_table(conn, table)
+        mod.create_table(conn, table)
 
         # 단건INS: 빈 테이블에서 먼저 측정 후 정리
-        si = measure_single_insert(conn, table, strategy_module, sig_pool) if "si" in benches else _zero_si
+        si = measure_single_insert(conn, table, mod, sig_pool) if "si" in benches else _zero_si
 
         # 범위INS: 1M 레코드 적재
         entity_ids = []
@@ -300,27 +310,27 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
                 batch.append((entity_id, pk, sig))
                 entity_ids.append(entity_id)
                 if len(batch) == INSERT_BATCH_SIZE:
-                    strategy_module.insert_batch(conn, table, batch)
+                    mod.insert_batch(conn, table, batch)
                     batch = []
             if batch:
-                strategy_module.insert_batch(conn, table, batch)
+                mod.insert_batch(conn, table, batch)
             insert_sec = time.perf_counter() - t0
             print(f"  [INSERT] 완료: {scale:,}건 / {insert_sec:.2f}초")
 
         if needs_data:
-            strategy_module.analyze(conn, table)
+            mod.analyze(conn, table)
             print("  ANALYZE 완료")
-            metrics = sqlite_collect_all(conn, strategy_module.get_main_table(table), strategy_module.get_index_name(table))
+            metrics = mod.collect_metrics(conn, table)
         else:
             metrics = _zero_m
 
-        pq  = measure_point_query(conn, table, strategy_module, entity_ids)  if "pq"     in benches and entity_ids else _zero_pq
-        rs  = measure_range_scan(conn, table, strategy_module, scale)        if "range"  in benches and entity_ids else _zero_rs
-        upd = measure_update(conn, table, strategy_module, entity_ids, sig_pool) if "update" in benches and entity_ids else _zero_upd
-        dl  = measure_delete(conn, table, strategy_module, entity_ids)       if "del"    in benches and entity_ids else _zero_dl
-        rd  = measure_range_delete(conn, table, strategy_module, entity_ids) if "rdel"   in benches and entity_ids else _zero_rd
+        pq  = measure_point_query(conn, table, mod, entity_ids)          if "pq"     in benches and entity_ids else _zero_pq
+        rs  = measure_range_scan(conn, table, mod, scale)                if "range"  in benches and entity_ids else _zero_rs
+        upd = measure_update(conn, table, mod, entity_ids, sig_pool)     if "update" in benches and entity_ids else _zero_upd
+        dl  = measure_delete(conn, table, mod, entity_ids)               if "del"    in benches and entity_ids else _zero_dl
+        rd  = measure_range_delete(conn, table, mod, entity_ids)         if "rdel"   in benches and entity_ids else _zero_rd
 
-        strategy_module.drop_table(conn, table)
+        mod.drop_table(conn, table)
         print("  테이블 삭제 완료")
 
     except Exception as e:
@@ -328,7 +338,7 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
         print(f"[오류] {e}")
         traceback.print_exc()
         try:
-            strategy_module.drop_table(conn, table)
+            mod.drop_table(conn, table)
         except Exception:
             pass
         conn.close()
@@ -336,8 +346,8 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
 
     conn.close()
 
-    overflow = sig_size > OVERFLOW_THRESHOLD
-    ov_pages = (max(0, (sig_size - OVERFLOW_THRESHOLD) // SQLITE_PAGE_SIZE + 1)
+    overflow = sig_size > overflow_threshold
+    ov_pages = (max(0, (sig_size - overflow_threshold) // page_size + 1)
                 if overflow else 0)
 
     return {
@@ -376,15 +386,15 @@ def run_one(algo_name: str, algo_info: dict, strategy: str, scale: int,
         "del_throughput_dps": dl["del_throughput_dps"],
         "rd_per_record_ms":   rd["rd_per_record_ms"],
         "rd_throughput_dps":  rd["rd_throughput_dps"],
-        "btree_depth":             metrics["btree_depth"],
-        "index_size_bytes":  metrics["index_size_bytes"],
-        "table_size_bytes":        metrics["table_size_bytes"],
-        "toast_size_bytes":  metrics["toast_size_bytes"],
-        "leaf_page_count":   metrics["leaf_page_count"],
-        "internal_page_count": metrics["internal_page_count"],
-        "overflow_page_count": metrics["overflow_page_count"],
-        "page_size":         metrics["page_size"],
-        "timestamp":         datetime.now().isoformat(),
+        "btree_depth":           metrics["btree_depth"],
+        "index_size_bytes":      metrics["index_size_bytes"],
+        "table_size_bytes":      metrics["table_size_bytes"],
+        "toast_size_bytes":      metrics["toast_size_bytes"],
+        "leaf_page_count":       metrics["leaf_page_count"],
+        "internal_page_count":   metrics["internal_page_count"],
+        "overflow_page_count":   metrics["overflow_page_count"],
+        "page_size":             metrics["page_size"],
+        "timestamp":             datetime.now().isoformat(),
     }
 
 # =============================================================================
@@ -424,14 +434,15 @@ def main():
         algos = [k for k, v in ALGORITHMS.items() if v["level"] == args.level]
     else:
         algos = list(ALGORITHMS.keys())
+
     def get_strategies(_) -> list:
         if args.strategy:
             return [args.strategy]
-        return STRATEGIES
+        return list(STRATEGY_MODULES.keys())
 
     total = sum(len(get_strategies(a)) * len(SCALES) for a in algos)
     print(f"PQC DB 성능 실험 - SQLite (실제 서명 방식)")
-    print(f"총 실험: {total}회 (전략 A)")
+    print(f"총 실험: {total}회")
     print(f"서명 풀 크기: {args.pool_size}개")
 
     done = 0

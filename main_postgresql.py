@@ -13,7 +13,7 @@ import sys
 import argparse
 from datetime import datetime
 
-from config import ALGORITHMS, STRATEGIES, SCALES, SIG_POOL_SIZE
+from config import ALGORITHMS, SCALES, SIG_POOL_SIZE
 from data.generator import build_sig_pool, generate_records
 from db.postgresql.connection import get_connection, setup_extensions, execute
 from metrics.pg_collector import collect_all, reset_stats
@@ -231,7 +231,7 @@ def main():
     def get_strategies(_) -> list:
         if args.strategy:
             return [args.strategy]
-        return STRATEGIES
+        return list(STRATEGY_MODULES.keys())
 
     total = sum(len(get_strategies(a)) * len(SCALES) for a in algos)
     print(f"PQC DB 성능 실험 - PostgreSQL (실제 서명 방식)")
